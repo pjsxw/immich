@@ -1,5 +1,5 @@
 import json
-from abc import abstractmethod
+from abc import abstractmethod, abstractproperty
 from functools import cached_property
 from io import BytesIO
 from pathlib import Path
@@ -14,7 +14,9 @@ from app.config import clean_name, log
 from app.models.transforms import crop, get_pil_resampling, normalize, resize, to_numpy
 from app.schemas import ModelType, ndarray_f32, ndarray_i32, ndarray_i64
 
+from .ann import AnnModel
 from .base import InferenceModel
+from .onnx import OnnxModel
 
 
 class BaseCLIPEncoder(InferenceModel):
@@ -30,7 +32,54 @@ class BaseCLIPEncoder(InferenceModel):
         self.mode = mode
         super().__init__(model_name, cache_dir, **model_kwargs)
 
+    @abstractmethod
+    def tokenize(self, text: str) -> dict[str, ndarray_i32]:
+        pass
+
+    @abstractmethod
+    def transform(self, image: Image.Image) -> dict[str, ndarray_f32]:
+        pass
+
+    @property
+    def textual_dir(self) -> Path:
+        return self.cache_dir / "textual"
+
+    @property
+    def visual_dir(self) -> Path:
+        return self.cache_dir / "visual"
+
+    @property
+    def model_cfg_path(self) -> Path:
+        return self.cache_dir / "config.json"
+
+    @abstractproperty
+    def textual_path(self) -> Path:
+        pass
+
+    @abstractproperty
+    def visual_path(self) -> Path:
+        pass
+
+    @property
+    def preprocess_cfg_path(self) -> Path:
+        return self.visual_dir / "preprocess_cfg.json"
+
+    @property
+    def cached(self) -> bool:
+        return self.textual_path.is_file() and self.visual_path.is_file()
+
+
+class BaseOnnxCLIPEncoder(BaseCLIPEncoder, OnnxModel):
+    @property
+    def textual_path(self) -> Path:
+        return self.textual_dir / "model.onnx"
+
+    @property
+    def visual_path(self) -> Path:
+        return self.visual_dir / "model.onnx"
+
     def _load(self) -> None:
+        super()._load()
         if self.mode == "text" or self.mode is None:
             log.debug(f"Loading clip text model '{self.model_name}'")
 
@@ -71,44 +120,50 @@ class BaseCLIPEncoder(InferenceModel):
 
         return outputs
 
-    @abstractmethod
-    def tokenize(self, text: str) -> dict[str, ndarray_i32]:
-        pass
 
-    @abstractmethod
-    def transform(self, image: Image.Image) -> dict[str, ndarray_f32]:
-        pass
-
-    @property
-    def textual_dir(self) -> Path:
-        return self.cache_dir / "textual"
-
-    @property
-    def visual_dir(self) -> Path:
-        return self.cache_dir / "visual"
-
-    @property
-    def model_cfg_path(self) -> Path:
-        return self.cache_dir / "config.json"
-
+class BaseAnnCLIPEncoder(BaseCLIPEncoder, AnnModel):
     @property
     def textual_path(self) -> Path:
-        return self.textual_dir / "model.onnx"
+        return self.textual_dir / "model.armnn"
 
     @property
     def visual_path(self) -> Path:
-        return self.visual_dir / "model.onnx"
+        return self.visual_dir / "model.armnn"
 
-    @property
-    def preprocess_cfg_path(self) -> Path:
-        return self.visual_dir / "preprocess_cfg.json"
+    def _load(self) -> None:
+        super()._load()
+        print(f"_load BaseAnnCLIPEncoder in mode {self.mode}")
+        if self.mode == "text" or self.mode is None:
+            log.debug(f"Loading clip text model '{self.model_name}'")
+            self.text_model = self.ann.load(self.textual_path.as_posix())
 
-    @property
-    def cached(self) -> bool:
-        return self.textual_path.is_file() and self.visual_path.is_file()
+        if self.mode == "vision" or self.mode is None:
+            log.debug(f"Loading clip vision model '{self.model_name}'")
+            self.vision_model = self.ann.load(self.visual_path.as_posix())
+
+    def _predict(self, image_or_text: Image.Image | str) -> ndarray_f32:
+        if isinstance(image_or_text, bytes):
+            image_or_text = Image.open(BytesIO(image_or_text))
+
+        match image_or_text:
+            case Image.Image():
+                if self.mode == "text":
+                    raise TypeError("Cannot encode image as text-only model")
+                img = next(iter(self.transform(image_or_text).values()))
+                img = np.moveaxis(img, 1, 3) # Ann expects input as NHWC
+                outputs: ndarray_f32 = self.ann.embed(self.vision_model, img)[0]
+            case str():
+                if self.mode == "vision":
+                    raise TypeError("Cannot encode text as vision-only model")
+
+                outputs = self.ann.embed(self.text_model, next(iter(self.tokenize(image_or_text).values())))[0]
+            case _:
+                raise TypeError(f"Expected Image or str, but got: {type(image_or_text)}")
+
+        return outputs
 
 
-class OpenCLIPEncoder(BaseCLIPEncoder):
+class OpenCLIPEncoderBase(BaseCLIPEncoder):
     def __init__(
         self,
         model_name: str,
@@ -120,16 +175,20 @@ class OpenCLIPEncoder(BaseCLIPEncoder):
 
     def _load(self) -> None:
         super()._load()
+        print(f"_load OpenCLIPEncoderBase in mode {self.mode}")
+        if self.mode == "text" or self.mode is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.textual_dir)
+            self.sequence_length = self.model_cfg["text_cfg"]["context_length"]
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.textual_dir)
-        self.sequence_length = self.model_cfg["text_cfg"]["context_length"]
-
-        self.size = (
-            self.preprocess_cfg["size"][0] if type(self.preprocess_cfg["size"]) == list else self.preprocess_cfg["size"]
-        )
-        self.resampling = get_pil_resampling(self.preprocess_cfg["interpolation"])
-        self.mean = np.array(self.preprocess_cfg["mean"], dtype=np.float32)
-        self.std = np.array(self.preprocess_cfg["std"], dtype=np.float32)
+        if self.mode == "vision" or self.mode is None:
+            self.size = (
+                self.preprocess_cfg["size"][0]
+                if type(self.preprocess_cfg["size"]) == list
+                else self.preprocess_cfg["size"]
+            )
+            self.resampling = get_pil_resampling(self.preprocess_cfg["interpolation"])
+            self.mean = np.array(self.preprocess_cfg["mean"], dtype=np.float32)
+            self.std = np.array(self.preprocess_cfg["std"], dtype=np.float32)
 
     def tokenize(self, text: str) -> dict[str, ndarray_i32]:
         input_ids: ndarray_i64 = self.tokenizer(
@@ -160,7 +219,15 @@ class OpenCLIPEncoder(BaseCLIPEncoder):
         return preprocess_cfg
 
 
-class MCLIPEncoder(OpenCLIPEncoder):
+class OpenCLIPEncoderOnnx(BaseOnnxCLIPEncoder, OpenCLIPEncoderBase):
+    pass
+
+
+class OpenCLIPEncoderAnn(BaseAnnCLIPEncoder, OpenCLIPEncoderBase):
+    pass
+
+
+class MCLIPEncoderOnnx(OpenCLIPEncoderOnnx):
     def tokenize(self, text: str) -> dict[str, ndarray_i32]:
         tokens: dict[str, ndarray_i64] = self.tokenizer(text, return_tensors="np")
         return {k: v.astype(np.int32) for k, v in tokens.items()}
