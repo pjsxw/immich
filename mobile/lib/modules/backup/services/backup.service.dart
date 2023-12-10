@@ -403,6 +403,7 @@ class BackupService {
       } finally {
         if (Platform.isIOS) {
           file?.deleteSync();
+          livePhotoFile?.deleteSync();
         }
       }
     }
