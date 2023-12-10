@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:cancellation_token_http/http.dart';
 import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -22,7 +21,6 @@ import 'package:openapi/api.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:photo_manager/photo_manager.dart';
 import 'package:cancellation_token_http/http.dart' as http;
-import 'package:path/path.dart' as p;
 
 final backupServiceProvider = Provider(
   (ref) => BackupService(
@@ -273,7 +271,6 @@ class BackupService {
           );
 
           file = await entity.loadFile(progressHandler: pmProgressHandler);
-          // TODO: verify if this is needed
           livePhotoFile = await entity.loadFile(
             withSubtype: true,
             progressHandler: pmProgressHandler,
@@ -338,9 +335,16 @@ class BackupService {
 
           // Send live photo separately
           if (entity.isLivePhoto) {
-            var livePhotoRawUploadData =
-                await _getLivePhotoMultiPart(livePhotoFile);
-            if (livePhotoRawUploadData != null) {
+            if (livePhotoFile != null) {
+              final livePhotoTitle = await entity.titleAsyncWithSubtype;
+              var fileStream = livePhotoFile.openRead();
+              var livePhotoRawUploadData = http.MultipartFile(
+                "assetData",
+                fileStream,
+                livePhotoFile.lengthSync(),
+                filename: livePhotoTitle,
+              );
+
               var livePhotoReq = MultipartRequest(
                 req.method,
                 req.url,
@@ -411,21 +415,6 @@ class BackupService {
       await _saveDuplicatedAssetIds(duplicatedAssetIds);
     }
     return !anyErrors;
-  }
-
-  Future<MultipartFile?> _getLivePhotoMultiPart(File? livePhotoFile) async {
-    if (livePhotoFile != null) {
-      var fileStream = livePhotoFile.openRead();
-      String fileName = p.basename(livePhotoFile.path);
-      return http.MultipartFile(
-        "assetData",
-        fileStream,
-        livePhotoFile.lengthSync(),
-        filename: fileName,
-      );
-    }
-
-    return null;
   }
 
   String _getAssetType(AssetType assetType) {
