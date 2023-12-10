@@ -227,6 +227,7 @@ class BackupService {
     final String deviceId = Store.get(StoreKey.deviceId);
     final String savedEndpoint = Store.get(StoreKey.serverEndpoint);
     File? file;
+    File? livePhotoFile;
     bool anyErrors = false;
     final List<String> duplicatedAssetIds = [];
 
@@ -249,7 +250,8 @@ class BackupService {
 
     for (var entity in assetsToUpload) {
       try {
-        final isAvailableLocally = await entity.isLocallyAvailable();
+        final isAvailableLocally =
+            await entity.isLocallyAvailable(isOrigin: true);
 
         // Handle getting files from iCloud
         if (!isAvailableLocally && Platform.isIOS) {
@@ -271,11 +273,20 @@ class BackupService {
           );
 
           file = await entity.loadFile(progressHandler: pmProgressHandler);
+          // TODO: verify if this is needed
+          livePhotoFile = await entity.loadFile(
+            withSubtype: true,
+            progressHandler: pmProgressHandler,
+          );
         } else {
           if (entity.type == AssetType.video) {
             file = await entity.originFile;
           } else {
             file = await entity.originFile.timeout(const Duration(seconds: 5));
+            if (entity.isLivePhoto) {
+              livePhotoFile = await entity.originFileWithSubtype
+                  .timeout(const Duration(seconds: 5));
+            }
           }
         }
 
@@ -327,7 +338,8 @@ class BackupService {
 
           // Send live photo separately
           if (entity.isLivePhoto) {
-            var livePhotoRawUploadData = await _getLivePhotoFile(entity);
+            var livePhotoRawUploadData =
+                await _getLivePhotoMultiPart(livePhotoFile);
             if (livePhotoRawUploadData != null) {
               var livePhotoReq = MultipartRequest(
                 req.method,
@@ -345,6 +357,10 @@ class BackupService {
                   cancellationToken: cancelToken,
                 );
               }
+            } else {
+              _log.warning(
+                "Failed to obtain motion part of the livePhoto - $originalFileName",
+              );
             }
           }
 
@@ -396,18 +412,14 @@ class BackupService {
     return !anyErrors;
   }
 
-  Future<MultipartFile?> _getLivePhotoFile(AssetEntity entity) async {
-    var motionFilePath = await entity.getMediaUrl();
-
-    if (motionFilePath != null) {
-      var validPath = motionFilePath.replaceAll('file://', '');
-      var motionFile = File(validPath);
-      var fileStream = motionFile.openRead();
-      String fileName = p.basename(motionFile.path);
+  Future<MultipartFile?> _getLivePhotoMultiPart(File? livePhotoFile) async {
+    if (livePhotoFile != null) {
+      var fileStream = livePhotoFile.openRead();
+      String fileName = p.basename(livePhotoFile.path);
       return http.MultipartFile(
         "assetData",
         fileStream,
-        motionFile.lengthSync(),
+        livePhotoFile.lengthSync(),
         filename: fileName,
       );
     }
